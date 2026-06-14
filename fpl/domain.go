@@ -2,7 +2,8 @@ package fpl
 
 import (
 	"context"
-	"net/url"
+	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
@@ -14,32 +15,26 @@ import (
 //
 //	import _ "github.com/tamnd/fpl-cli/fpl"
 //
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// fpl:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone fpl binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
+// The init below registers it; the host then dereferences fpl:// URIs by
+// routing to the operations Register installs. The same Domain also builds the
+// standalone fpl binary (see cli.NewApp), so the binary and a host share one
+// source of truth.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the fpl driver. It carries no state; the per-run client is
-// built by the factory Register hands kit.
+// Domain is the fpl driver.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, hostnames, and binary identity.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "fpl",
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "fpl",
-			Short:  "A command line for fpl.",
-			Long: `A command line for fpl.
+			Short:  "A command line for Fantasy Premier League.",
+			Long: `A command line for Fantasy Premier League.
 
-fpl reads public fpl data over plain HTTPS, shapes it into
+fpl reads public Fantasy Premier League data over plain HTTPS, shapes it into
 clean records, and prints output that pipes into the rest of your tools. No API
 key, nothing to run alongside it.`,
 			Site: Host,
@@ -48,28 +43,45 @@ key, nothing to run alongside it.`,
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `fpl page` and
-	// `ant get fpl://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{
+		Name: "players", Group: "read", List: true,
+		Summary: "List all FPL players",
+	}, listPlayers)
 
-	// List op: members of a page, the home of `fpl links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// fpl://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{
+		Name: "teams", Group: "read", List: true,
+		Summary: "List all Premier League teams",
+	}, listTeams)
+
+	kit.Handle(app, kit.OpMeta{
+		Name: "gameweeks", Group: "read", List: true,
+		Summary: "List all FPL gameweeks",
+	}, listGameweeks)
+
+	kit.Handle(app, kit.OpMeta{
+		Name: "fixtures", Group: "read", List: true,
+		Summary: "List fixtures for a gameweek",
+		Args:    []kit.Arg{{Name: "gameweek", Help: "gameweek number"}},
+	}, listFixtures)
+
+	kit.Handle(app, kit.OpMeta{
+		Name: "player-history", Group: "read", List: true,
+		Summary: "Show a player's gameweek history",
+		Args:    []kit.Arg{{Name: "id", Help: "player element ID"}},
+	}, listPlayerHistory)
+
+	kit.Handle(app, kit.OpMeta{
+		Name: "standings", Group: "read", List: true,
+		Summary: "Show classic league standings",
+		Args:    []kit.Arg{{Name: "league", Help: "league ID"}},
+	}, listStandings)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the client from the host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
 	c := NewClient()
 	if cfg.UserAgent != "" {
@@ -87,87 +99,190 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 	return c, nil
 }
 
-// --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
+// --- input structs ---
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type playersInput struct {
+	Limit  int     `kit:"flag,inherit"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
+type teamsInput struct {
+	Client *Client `kit:"inject"`
+}
+
+type gameweeksInput struct {
+	Client *Client `kit:"inject"`
+}
+
+type fixturesInput struct {
+	Gameweek int     `kit:"arg" help:"gameweek number"`
+	Client   *Client `kit:"inject"`
+}
+
+type playerHistoryInput struct {
+	ID     int     `kit:"arg" help:"player element ID"`
+	Client *Client `kit:"inject"`
+}
+
+type standingsInput struct {
+	League int     `kit:"arg" help:"league ID"`
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func listPlayers(ctx context.Context, in playersInput, emit func(*Player) error) error {
+	players, _, _, err := in.Client.BootstrapStatic(ctx)
 	if err != nil {
-		return mapErr(err)
+		return err
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
-	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for i := range players {
+		if in.Limit > 0 && i >= in.Limit {
+			break
+		}
+		if err := emit(&players[i]); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full fpl.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized fpl reference: %q", input)
+func listTeams(ctx context.Context, in teamsInput, emit func(*Team) error) error {
+	_, teams, _, err := in.Client.BootstrapStatic(ctx)
+	if err != nil {
+		return err
 	}
-	return "page", id, nil
+	for i := range teams {
+		if err := emit(&teams[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func listGameweeks(ctx context.Context, in gameweeksInput, emit func(*Gameweek) error) error {
+	_, _, gameweeks, err := in.Client.BootstrapStatic(ctx)
+	if err != nil {
+		return err
+	}
+	for i := range gameweeks {
+		if err := emit(&gameweeks[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func listFixtures(ctx context.Context, in fixturesInput, emit func(*Fixture) error) error {
+	fixtures, err := in.Client.Fixtures(ctx, in.Gameweek)
+	if err != nil {
+		return err
+	}
+	for i := range fixtures {
+		if err := emit(&fixtures[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func listPlayerHistory(ctx context.Context, in playerHistoryInput, emit func(*PlayerHistory) error) error {
+	history, err := in.Client.PlayerSummary(ctx, in.ID)
+	if err != nil {
+		return err
+	}
+	for i := range history {
+		if err := emit(&history[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func listStandings(ctx context.Context, in standingsInput, emit func(*StandingEntry) error) error {
+	_, entries, err := in.Client.LeagueStandings(ctx, in.League)
+	if err != nil {
+		return err
+	}
+	for i := range entries {
+		if err := emit(&entries[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// --- Resolver: pure string functions ---
+
+// Classify turns an accepted input into (uriType, id).
+// Numeric string → "player"; "gw:" prefix → "gameweek"; "l:" prefix → "league".
+func (Domain) Classify(input string) (uriType, id string, err error) {
+	input = strings.TrimSpace(input)
+
+	// full URL on this host
+	if strings.HasPrefix(input, "https://"+Host) || strings.HasPrefix(input, "http://"+Host) {
+		trimmed := strings.TrimPrefix(strings.TrimPrefix(input, "https://"+Host), "http://"+Host)
+		trimmed = strings.Trim(trimmed, "/")
+		return classifyPath(trimmed)
+	}
+
+	// prefixed shorthand
+	if strings.HasPrefix(input, "gw:") {
+		id = strings.TrimPrefix(input, "gw:")
+		if _, err2 := strconv.Atoi(id); err2 != nil {
+			return "", "", errs.Usage("gameweek id must be numeric: %q", id)
+		}
+		return "gameweek", id, nil
+	}
+	if strings.HasPrefix(input, "l:") {
+		id = strings.TrimPrefix(input, "l:")
+		if _, err2 := strconv.Atoi(id); err2 != nil {
+			return "", "", errs.Usage("league id must be numeric: %q", id)
+		}
+		return "league", id, nil
+	}
+
+	// bare numeric → player
+	if _, err2 := strconv.Atoi(input); err2 == nil {
+		return "player", input, nil
+	}
+
+	return "", "", errs.Usage("unrecognized fpl reference: %q", input)
+}
+
+func classifyPath(path string) (uriType, id string, err error) {
+	parts := strings.SplitN(path, "/", 2)
+	switch parts[0] {
+	case "element-summary":
+		if len(parts) < 2 {
+			return "", "", errs.Usage("missing player id in path")
+		}
+		return "player", strings.Trim(parts[1], "/"), nil
+	case "leagues":
+		if len(parts) < 2 {
+			return "", "", errs.Usage("missing league id in path")
+		}
+		id = strings.Split(strings.Trim(parts[1], "/"), "/")[0]
+		return "league", id, nil
+	}
+	return "", "", errs.Usage("unrecognized fpl path: %q", path)
 }
 
 // Locate is the inverse: the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
-		return "", errs.Usage("fpl has no resource type %q", uriType)
+	switch uriType {
+	case "player":
+		return fmt.Sprintf("https://%s/element-summary/%s", Host, id), nil
+	case "league":
+		return fmt.Sprintf("https://%s/leagues/%s/standings/c", Host, id), nil
+	case "gameweek":
+		return fmt.Sprintf("https://%s/api/fixtures/?event=%s", Host, id), nil
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
+	return "", errs.Usage("fpl has no resource type %q", uriType)
 }
 
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// mapErr converts a library error into the kit error kind that carries the
+// right exit code.
 func mapErr(err error) error {
 	return err
 }
